@@ -1,84 +1,21 @@
 import json
 import os
 import re
+import statistics
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlalchemy import inspect, or_, select, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, undefer
 
+from . import embeddings, guidance
 from .database import Base, SessionLocal, engine
 from .models import Incident, Project, User, Workspace, WorkspaceMember
-from .schemas import AuthCredentials, EmployeeCreate, IncidentCreate, IncidentRead, PasswordChange, PriorityUpdate, ProjectCreate, ProjectRead, TeamLeadSetup, UserStatusUpdate, WorkspaceAccess, WorkspaceCreate, WorkspaceRead
+from .schemas import AuthCredentials, EmployeeCreate, ChatRequest, IncidentCreate, IncidentMatch, IncidentRead, PasswordChange, PriorityUpdate, ProjectCreate, ProjectRead, SearchResponse, TeamLeadSetup, UserStatusUpdate, WorkspaceAccess, WorkspaceCreate, WorkspaceRead
 from .security import SESSION_COOKIE, SESSION_HOURS, hash_password, issue_token, read_token, verify_password
-
-WORKSPACE_NAME = "Acme Engineering"
-WORKSPACE_SLUG = "acme-engineering"
-STARTER_PROJECTS = [
-    ("Web App", "Customer-facing web application."),
-    ("API Service", "Backend APIs and data services."),
-    ("Platform & DevEx", "Infrastructure, tooling, and developer experience."),
-]
-
-STARTER_INCIDENTS = [
-    {
-        "title": "API requests timing out after deployment",
-        "category": "API & INFRASTRUCTURE",
-        "symptoms": "Requests to /api/orders started timing out intermittently right after the production deploy. The app looked healthy, but p95 latency jumped from 180 ms to 8 seconds.",
-        "cause": "The new release opened a database connection for each request and never returned it to the pool. Under normal traffic the leak was hard to spot.",
-        "fix": "1. Reuse the shared connection pool instead of creating a client per request.\n2. Make sure every transaction returns its connection in a finally block.\n3. Watch the pool’s active connection count after deploying.",
-        "tags": ["Postgres", "API", "Performance"],
-        "author": "Aarav Mehta",
-        "verified": True,
-        "project_slug": "api-service",
-    },
-    {
-        "title": "Hydration mismatch on the dashboard after refresh",
-        "category": "FRONTEND",
-        "symptoms": "The dashboard flashed, then React logged ‘Text content does not match server-rendered HTML.’ It only happened on a hard refresh for users in different time zones.",
-        "cause": "A date was formatted using the server’s timezone during render and the browser’s local timezone during hydration.",
-        "fix": "Format dates with an explicit timezone on both server and client, or render locale-specific values after hydration. We used Intl.DateTimeFormat with timeZone: UTC for the shared initial render.",
-        "tags": ["React", "SSR", "Hydration"],
-        "author": "Sofia Kim",
-        "verified": True,
-        "project_slug": "web-app",
-    },
-    {
-        "title": "Docker services can’t resolve each other by name",
-        "category": "DEVELOPMENT ENVIRONMENT",
-        "symptoms": "The worker container returned getaddrinfo ENOTFOUND api, while both containers appeared to be running.",
-        "cause": "The services were started separately with docker run, so they were attached to different default networks.",
-        "fix": "Start both services from the same Compose project and use the Compose service name as the hostname. Confirm the shared network with docker network inspect.",
-        "tags": ["Docker", "Networking", "Local dev"],
-        "author": "Nikhil Rao",
-        "verified": True,
-        "project_slug": "platform-devex",
-    },
-    {
-        "title": "Users get logged out after leaving a tab idle",
-        "category": "AUTHENTICATION",
-        "symptoms": "After leaving the app open for a while, the next API action returned 401 and sent users to the sign-in screen, even though their refresh token was still valid.",
-        "cause": "The API client retried the original request before the asynchronous refresh-token call had completed.",
-        "fix": "Queue requests while a token refresh is in flight. Update the shared access token once, then replay queued requests. Handle a failed refresh by clearing the session and prompting a fresh sign-in.",
-        "tags": ["Auth", "API", "React"],
-        "author": "Amara Okafor",
-        "verified": False,
-        "project_slug": "web-app",
-    },
-    {
-        "title": "Database migration hangs on a table lock",
-        "category": "DATABASE",
-        "symptoms": "A routine migration appeared stuck in production and blocked writes to the accounts table.",
-        "cause": "The migration added a non-null column with a default value in one operation, forcing a full table rewrite while holding an exclusive lock.",
-        "fix": "Use an expand-and-contract migration: add the nullable column first, backfill in small batches, then add the constraint once the data is ready.",
-        "tags": ["Postgres", "Migrations", "Production"],
-        "author": "Luca Moretti",
-        "verified": True,
-        "project_slug": "api-service",
-    },
-]
 
 
 @asynccontextmanager
@@ -94,47 +31,21 @@ async def lifespan(_: FastAPI):
             connection.execute(text("ALTER TABLE incidents ADD COLUMN project_id INTEGER REFERENCES projects(id)"))
         if "priority" not in existing_columns:
             connection.execute(text("ALTER TABLE incidents ADD COLUMN priority VARCHAR(8) NOT NULL DEFAULT 'medium'"))
+        new_columns = {
+            "environment": "TEXT NOT NULL DEFAULT ''",
+            "steps": "TEXT NOT NULL DEFAULT ''",
+            "prevention": "TEXT NOT NULL DEFAULT ''",
+            "reference_url": "VARCHAR(500) NOT NULL DEFAULT ''",
+            "resolution_minutes": "INTEGER",
+            "author_id": "INTEGER REFERENCES users(id)",
+            "updated_at": "TIMESTAMP",
+            "embedding": "TEXT",
+            "embedding_model": "VARCHAR(80)",
+        }
+        for name, definition in new_columns.items():
+            if name not in existing_columns:
+                connection.execute(text(f"ALTER TABLE incidents ADD COLUMN {name} {definition}"))
 
-    with SessionLocal() as session:
-        workspace = session.scalar(select(Workspace).where(Workspace.slug == WORKSPACE_SLUG))
-        if workspace is None:
-            workspace = Workspace(name=WORKSPACE_NAME, slug=WORKSPACE_SLUG)
-            session.add(workspace)
-            session.flush()
-        projects_by_slug = {}
-        for name, description in STARTER_PROJECTS:
-            slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-            project = session.scalar(select(Project).where(Project.workspace_id == workspace.id, Project.slug == slug))
-            if project is None:
-                project = Project(workspace_id=workspace.id, name=name, slug=slug, description=description)
-                session.add(project)
-                session.flush()
-            projects_by_slug[slug] = project
-        session.execute(
-            text("UPDATE incidents SET workspace_id = :workspace_id WHERE workspace_id IS NULL"),
-            {"workspace_id": workspace.id},
-        )
-        for sample in STARTER_INCIDENTS:
-            existing = session.scalar(select(Incident).where(Incident.title == sample["title"]))
-            if existing is not None and existing.project_id is None:
-                existing.project_id = projects_by_slug[sample["project_slug"]].id
-        if session.scalar(select(Incident.id).limit(1)) is None:
-            for days_ago, item in enumerate(STARTER_INCIDENTS, start=2):
-                seed = {
-                    "workspace_id": workspace.id,
-                    "project_id": projects_by_slug[item["project_slug"]].id,
-                    "title": item["title"],
-                    "category": item["category"],
-                    "symptoms": item["symptoms"],
-                    "cause": item["cause"],
-                    "fix": item["fix"],
-                    "tags": json.dumps(item["tags"]),
-                    "author": item["author"],
-                    "verified": item["verified"],
-                    "created_at": datetime.now(timezone.utc) - timedelta(days=days_ago),
-                }
-                session.add(Incident(**seed))
-        session.commit()
     yield
 
 
@@ -154,10 +65,7 @@ def get_session():
 
 
 def resolve_workspace(session: Session, workspace_id: int | None) -> Workspace:
-    if workspace_id is None:
-        workspace = session.scalar(select(Workspace).where(Workspace.slug == WORKSPACE_SLUG))
-    else:
-        workspace = session.get(Workspace, workspace_id)
+    workspace = session.get(Workspace, workspace_id) if workspace_id is not None else None
     if workspace is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return workspace
@@ -218,8 +126,17 @@ def user_payload(user: User):
     }
 
 
-def serialize(incident: Incident) -> IncidentRead:
+def serialize(incident: Incident, user: User | None = None, role: str | None = None) -> IncidentRead:
+    can_edit = user is not None and (role == "team_lead" or (incident.author_id is not None and incident.author_id == user.id))
     return IncidentRead(
+        can_edit=can_edit,
+        environment=incident.environment,
+        steps=incident.steps,
+        prevention=incident.prevention,
+        reference_url=incident.reference_url,
+        resolution_minutes=incident.resolution_minutes,
+        author_id=incident.author_id,
+        updated_at=incident.updated_at,
         id=incident.id,
         workspace_id=incident.workspace_id,
         project_id=incident.project_id,
@@ -251,9 +168,12 @@ def setup_status(session: Session = Depends(get_session)):
 def setup_team_lead(payload: TeamLeadSetup, response: Response, session: Session = Depends(get_session)):
     if session.scalar(select(User.id).limit(1)) is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Initial setup has already been completed")
-    workspace = session.scalar(select(Workspace).where(Workspace.slug == WORKSPACE_SLUG))
-    if workspace is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Default workspace is not initialized")
+    slug = re.sub(r"[^a-z0-9]+", "-", payload.workspace_name.lower()).strip("-")
+    if not slug:
+        raise HTTPException(status_code=422, detail="Workspace name must include a letter or number")
+    workspace = Workspace(name=payload.workspace_name, slug=slug)
+    session.add(workspace)
+    session.flush()
     user = User(name=payload.name, email=payload.email, password_hash=hash_password(payload.password))
     session.add(user)
     session.flush()
@@ -494,6 +414,141 @@ def remove_employee(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+def index_incident(incident: Incident) -> bool:
+    """Store an embedding for the incident. Saving must never fail because Ollama is down."""
+    try:
+        vector = embeddings.embed_text(embeddings.incident_text(incident.title, incident.symptoms, incident.cause, json.loads(incident.tags)))
+    except embeddings.EmbeddingUnavailable:
+        incident.embedding = None
+        incident.embedding_model = None
+        return False
+    incident.embedding = json.dumps(vector)
+    incident.embedding_model = embeddings.EMBED_MODEL
+    return True
+
+
+LAZY_INDEX_LIMIT = 25
+MAX_RESULTS = 20
+
+
+def rank_incidents(session: Session, workspace: Workspace, q: str):
+    """Return (mode, unindexed, ranked) where ranked is [(incident, score, cosine, keyword)] best first."""
+    incidents = session.scalars(
+        select(Incident).options(undefer(Incident.embedding)).where(Incident.workspace_id == workspace.id)
+    ).all()
+
+    def full_text(item: Incident) -> str:
+        return " ".join([item.title, item.symptoms, item.cause, item.fix, item.environment, " ".join(json.loads(item.tags))])
+
+    unindexed = 0
+    try:
+        query_vector = embeddings.embed_text(q)
+    except embeddings.EmbeddingUnavailable:
+        scored = [(item, embeddings.keyword_score(q, full_text(item)), 0.0, 0.0) for item in incidents]
+        ranked = sorted((row for row in scored if row[1] > 0), key=lambda row: row[1], reverse=True)
+        return "keyword", unindexed, ranked[:MAX_RESULTS]
+
+    scored = []
+    budget = LAZY_INDEX_LIMIT
+    for item in incidents:
+        if (item.embedding is None or item.embedding_model != embeddings.EMBED_MODEL) and budget > 0:
+            budget -= 1
+            index_incident(item)
+        if item.embedding is None:
+            unindexed += 1
+            continue
+        similarity = embeddings.cosine(query_vector, json.loads(item.embedding))
+        keyword = embeddings.keyword_score(q, full_text(item))
+        # Blend in keyword overlap so exact error strings still rank well.
+        scored.append((item, similarity + 0.3 * keyword, similarity, keyword))
+    session.commit()
+    similarities = [row[2] for row in scored]
+    best = max(similarities, default=0.0)
+    # Error-shaped text scores 0.5+ against every incident, so a fixed cutoff is not enough: a real
+    # match must also stand out from the library's typical score. (Skipped for tiny libraries.)
+    baseline = statistics.median(similarities) if len(similarities) >= embeddings.MIN_LIBRARY_FOR_MARGIN else None
+    # Keep real matches only: close to the best semantic match and clear of the pack, or sharing the query's own words.
+    relevant = [
+        row for row in scored
+        if (
+            row[2] >= embeddings.MIN_RELEVANCE
+            and row[2] >= best - embeddings.RELEVANCE_WINDOW
+            and (baseline is None or row[2] - baseline >= embeddings.MIN_MARGIN)
+        )
+        or row[3] >= embeddings.KEYWORD_MATCH
+    ]
+    ranked = sorted(relevant, key=lambda row: row[1], reverse=True)
+    return "semantic", unindexed, ranked[:MAX_RESULTS]
+
+
+@app.get("/api/incidents/search", response_model=SearchResponse)
+def search_incidents(
+    q: str = Query(min_length=2, max_length=4000),
+    workspace_id: int | None = Query(default=None, gt=0),
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    workspace, membership = require_workspace_member(session, user, workspace_id)
+    mode, unindexed, ranked = rank_incidents(session, workspace, q)
+    return SearchResponse(
+        mode=mode,
+        unindexed=unindexed,
+        results=[IncidentMatch(incident=serialize(item, user, membership.role), score=round(score, 4)) for item, score, _, _ in ranked],
+    )
+
+
+CHAT_SOURCES = 3
+CHAT_UNAVAILABLE = "The local AI model did not respond. Check that Ollama is running and the model is installed, then try again."
+
+
+def ndjson(event: dict) -> str:
+    return json.dumps(event) + "\n"
+
+
+@app.post("/api/incidents/chat")
+def incident_chat(
+    payload: ChatRequest,
+    workspace_id: int | None = Query(default=None, gt=0),
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    workspace, _ = require_workspace_member(session, user, workspace_id)
+    question = payload.messages[-1].content
+    earlier_questions = [message.content for message in payload.messages[:-1] if message.role == "user"]
+    last_reply = next((message for message in reversed(payload.messages) if message.role == "assistant"), None)
+    # A follow-up like "what about the pool size?" only makes sense together with the previous question,
+    # and so does any follow-up in a conversation that is already grounded in team incidents.
+    in_grounded_chat = last_reply is not None and last_reply.grounded is True
+    combine = bool(earlier_questions) and (len(question) < 40 or in_grounded_chat)
+    retrieval_query = f"{earlier_questions[-1][:600]}\n{question}" if combine else question
+    mode, _, ranked = rank_incidents(session, workspace, retrieval_query)
+    if mode == "keyword":
+        ranked = [row for row in ranked if row[1] >= 0.5]
+    if last_reply is not None and last_reply.grounded is False:
+        ranked = [row for row in ranked if row[2] >= embeddings.FOLLOWUP_RELEVANCE]
+    # Trusted fixes first: verified incidents, then unverified ones (clearly labelled in the prompt).
+    ranked.sort(key=lambda row: (not row[0].verified, -row[1]))
+    chosen = [row[0] for row in ranked[:CHAT_SOURCES]]
+    system = guidance.build_system(
+        [{"title": i.title, "symptoms": i.symptoms, "cause": i.cause, "fix": i.fix, "verified": i.verified} for i in chosen],
+        first_turn=len(payload.messages) == 1,
+    )
+    sources = [{"number": n, "id": i.id, "title": i.title, "verified": i.verified} for n, i in enumerate(chosen, start=1)]
+    history = [{"role": message.role, "content": message.content} for message in payload.messages]
+
+    def stream():
+        # All database work is finished above; this generator only talks to Ollama.
+        yield ndjson({"type": "meta", "grounded": bool(chosen), "sources": sources})
+        try:
+            for chunk in guidance.stream_chat(system, history):
+                yield ndjson({"type": "token", "text": chunk})
+        except embeddings.EmbeddingUnavailable:
+            yield ndjson({"type": "error", "message": CHAT_UNAVAILABLE})
+        yield ndjson({"type": "done"})
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @app.get("/api/incidents", response_model=list[IncidentRead])
 def list_incidents(
     q: str = Query(default="", max_length=500),
@@ -503,7 +558,7 @@ def list_incidents(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
-    workspace, _ = require_workspace_member(session, user, workspace_id)
+    workspace, membership = require_workspace_member(session, user, workspace_id)
     statement = select(Incident).where(Incident.workspace_id == workspace.id)
     if q.strip():
         pattern = f"%{q.strip()}%"
@@ -513,7 +568,30 @@ def list_incidents(
     if project_id is not None:
         statement = statement.where(Incident.project_id == project_id)
     incidents = session.scalars(statement.order_by(Incident.created_at.desc(), Incident.id.desc())).all()
-    return [serialize(incident) for incident in incidents]
+    return [serialize(incident, user, membership.role) for incident in incidents]
+
+
+def apply_incident_fields(incident: Incident, payload: IncidentCreate):
+    incident.title = payload.title
+    incident.category = payload.category or (payload.tags[0].upper() if payload.tags else "TEAM INCIDENT")
+    incident.symptoms = payload.symptoms
+    incident.cause = payload.cause
+    incident.fix = payload.fix
+    incident.environment = payload.environment
+    incident.steps = payload.steps
+    incident.prevention = payload.prevention
+    incident.reference_url = payload.reference_url
+    incident.resolution_minutes = payload.resolution_minutes
+    incident.tags = json.dumps(payload.tags)
+    incident.priority = payload.priority
+    incident.project_id = payload.project_id
+
+
+def check_project(session: Session, workspace: Workspace, project_id: int | None):
+    if project_id is not None:
+        project = session.get(Project, project_id)
+        if project is None or project.workspace_id != workspace.id:
+            raise HTTPException(status_code=422, detail="Choose a project from this workspace")
 
 
 @app.post("/api/incidents", response_model=IncidentRead, status_code=status.HTTP_201_CREATED)
@@ -523,34 +601,67 @@ def create_incident(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
-    if not payload.title or not payload.symptoms or not payload.cause or not payload.fix:
-        raise HTTPException(status_code=422, detail="Title, symptoms, root cause, and fix are required.")
     workspace, membership = require_workspace_member(session, user, workspace_id)
     if payload.verified and membership.role != "team_lead":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only a Team Lead can verify an incident")
-    if payload.project_id is not None:
-        project = session.get(Project, payload.project_id)
-        if project is None or project.workspace_id != workspace.id:
-            raise HTTPException(status_code=422, detail="Choose a project from this workspace")
-    category = payload.category or (payload.tags[0].upper() if payload.tags else "TEAM INCIDENT")
+    check_project(session, workspace, payload.project_id)
     incident = Incident(
         workspace_id=workspace.id,
-        project_id=payload.project_id,
-        title=payload.title,
-        category=category,
-        symptoms=payload.symptoms,
-        cause=payload.cause,
-        fix=payload.fix,
-        tags=json.dumps(payload.tags),
         author=user.name,
+        author_id=user.id,
         verified=payload.verified,
-        priority=payload.priority,
         created_at=datetime.now(timezone.utc),
     )
+    apply_incident_fields(incident, payload)
+    index_incident(incident)
     session.add(incident)
     session.commit()
     session.refresh(incident)
-    return serialize(incident)
+    return serialize(incident, user, membership.role)
+
+
+def load_editable_incident(session: Session, user: User, workspace_id: int, incident_id: int):
+    workspace, membership = require_workspace_member(session, user, workspace_id)
+    incident = session.get(Incident, incident_id)
+    if incident is None or incident.workspace_id != workspace.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
+    is_author = incident.author_id is not None and incident.author_id == user.id
+    if membership.role != "team_lead" and not is_author:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the author or a Team Lead can change this incident")
+    return workspace, membership, incident
+
+
+@app.put("/api/incidents/{incident_id}", response_model=IncidentRead)
+def update_incident(
+    incident_id: int,
+    payload: IncidentCreate,
+    workspace_id: int = Query(gt=0),
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    workspace, membership, incident = load_editable_incident(session, user, workspace_id, incident_id)
+    check_project(session, workspace, payload.project_id)
+    apply_incident_fields(incident, payload)
+    # Only a Team Lead can keep or grant verification; an employee's edit sends the fix back for review.
+    incident.verified = payload.verified if membership.role == "team_lead" else False
+    incident.updated_at = datetime.now(timezone.utc)
+    index_incident(incident)
+    session.commit()
+    session.refresh(incident)
+    return serialize(incident, user, membership.role)
+
+
+@app.delete("/api/incidents/{incident_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_incident(
+    incident_id: int,
+    workspace_id: int = Query(gt=0),
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    _, _, incident = load_editable_incident(session, user, workspace_id, incident_id)
+    session.delete(incident)
+    session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.get("/api/projects", response_model=list[ProjectRead])
@@ -598,13 +709,13 @@ def update_incident_priority(
     session: Session = Depends(get_session),
 ):
     incident = session.get(Incident, incident_id)
-    workspace, _ = require_workspace_member(session, user, workspace_id)
+    workspace, membership = require_workspace_member(session, user, workspace_id)
     if incident is None or incident.workspace_id != workspace.id:
         raise HTTPException(status_code=404, detail="Incident not found")
     incident.priority = payload.priority
     session.commit()
     session.refresh(incident)
-    return serialize(incident)
+    return serialize(incident, user, membership.role)
 
 
 @app.patch("/api/incidents/{incident_id}/verification", response_model=IncidentRead)
@@ -614,14 +725,14 @@ def verify_incident(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
-    workspace, _ = require_team_lead(session, user, workspace_id)
+    workspace, membership = require_team_lead(session, user, workspace_id)
     incident = session.get(Incident, incident_id)
     if incident is None or incident.workspace_id != workspace.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
     incident.verified = True
     session.commit()
     session.refresh(incident)
-    return serialize(incident)
+    return serialize(incident, user, membership.role)
 
 
 @app.get("/api/incidents/{incident_id}", response_model=IncidentRead)
@@ -632,7 +743,7 @@ def get_incident(
     session: Session = Depends(get_session),
 ):
     incident = session.get(Incident, incident_id)
-    workspace, _ = require_workspace_member(session, user, workspace_id)
+    workspace, membership = require_workspace_member(session, user, workspace_id)
     if incident is None or incident.workspace_id != workspace.id:
         raise HTTPException(status_code=404, detail="Incident not found")
-    return serialize(incident)
+    return serialize(incident, user, membership.role)

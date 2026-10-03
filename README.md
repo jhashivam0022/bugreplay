@@ -33,19 +33,14 @@ The goal is not to replace developers or mentors, but to help teams debug smarte
 
 * 🔍 **Semantic Bug Search**
   Find similar, previously resolved bugs using semantic search rather than relying only on exact keyword matches.
-
 * 🧠 **Root Cause Insights**
   Explore the root causes and fixes documented in similar incidents.
-
 * 🤖 **AI-Powered Troubleshooting**
   Get AI-generated debugging guidance grounded in the team's previous verified solutions.
-
 * 📚 **Shared Debugging Knowledge**
   Store resolved incidents in a searchable knowledge base accessible to the team.
-
 * 🤝 **Mentor Verification**
   Allow mentors or authorized team members to review and approve solutions before they become trusted knowledge.
-
 * 🔄 **Continuous Learning**
   Add newly resolved bugs to the knowledge base so the team can benefit from future discoveries.
 
@@ -53,16 +48,12 @@ The goal is not to replace developers or mentors, but to help teams debug smarte
 
 1. **Submit an Error**
    A developer pastes an error message, stack trace, or relevant log into BugReplay.
-
 2. **Search Similar Incidents**
    The system uses semantic search to retrieve relevant incidents from the team's knowledge base.
-
 3. **Review Previous Solutions**
    Developers can inspect the symptoms, verified root causes, and solutions from matching incidents.
-
 4. **Get AI Guidance**
    The AI uses the retrieved incidents to suggest possible troubleshooting steps while recognizing that similar errors can have different causes.
-
 5. **Verify and Save**
    Once the new issue is resolved, the solution can be reviewed and approved before being added to the shared knowledge base.
 
@@ -79,7 +70,7 @@ The goal is not to replace developers or mentors, but to help teams debug smarte
 
 ## 🚀 Getting Started
 
-BugReplay runs locally with a React/Vite frontend and a FastAPI backend. The backend creates a SQLite database at `backend/bugreplay.db` on first run and adds starter incidents and projects.
+BugReplay runs locally with a React/Vite frontend and a FastAPI backend. The backend creates an empty SQLite database at `backend/bugreplay.db` on first run. There is no sample data.
 
 ### Prerequisites
 
@@ -117,6 +108,30 @@ python -m pip install -r requirements.txt
 python -m uvicorn app.main:app --reload
 ```
 
+### Enable AI search and guidance (optional)
+
+BugReplay uses a local [Ollama](https://ollama.com) server for semantic search and AI troubleshooting guidance. Without Ollama the search box falls back to keyword matching, and everything else keeps working.
+
+```bash
+ollama pull nomic-embed-text
+ollama pull gemma:2b
+```
+
+Keep Ollama running on its default port (`11434`). Settings are environment variables read when the backend starts:
+
+| Variable | Default | Purpose |
+| -------- | ------- | ------- |
+| `BUGREPLAY_OLLAMA_URL` | `http://localhost:11434` | Ollama server address |
+| `BUGREPLAY_EMBED_MODEL` | `nomic-embed-text` | Model that turns incidents and queries into embeddings |
+| `BUGREPLAY_LLM_MODEL` | `gemma:2b` | Model that writes the guidance (any Ollama chat model, such as a Qwen model) |
+| `BUGREPLAY_LLM_TIMEOUT` | `180` | Seconds to wait for a guidance answer |
+| `BUGREPLAY_MIN_RELEVANCE` | `0.5` | Minimum similarity for an incident to be used as a source |
+| `BUGREPLAY_RELEVANCE_WINDOW` | `0.1` | How close to the best match a source must score |
+
+Incidents are embedded when saved. Incidents saved while Ollama was offline, or before you changed the embedding model, are indexed on the next search.
+
+**Get AI guidance** (shown under the search box) retrieves the closest resolved incidents, prefers Team Lead verified ones, and asks the model for troubleshooting steps grounded only in them. It cites its sources and says so when nothing matches closely enough.
+
 ### Install and run the frontend
 
 Open a second terminal from the repository root:
@@ -129,7 +144,7 @@ npm run dev
 
 Open [http://localhost:5173](http://localhost:5173). The API runs at [http://localhost:8000](http://localhost:8000), and its interactive documentation is at [http://localhost:8000/docs](http://localhost:8000/docs). Keep both servers running while using the app.
 
-On first run, create the Team Lead account from the setup screen. The first account becomes Team Lead for the default workspace; there is no default password. Team Leads can add employees or other Team Leads from the **Team members** sidebar tab.
+On first run, name your workspace and create the Team Lead account from the setup screen. The first account becomes Team Lead for that workspace; there is no default password. Team Leads can add employees or other Team Leads from the **Team members** sidebar tab.
 
 ## 🔐 Privacy and Security
 
@@ -142,17 +157,17 @@ BugReplay is intended to work with approved, non-sensitive debugging incidents.
 
 ## 🗺️ Roadmap
 
-* [x] Build the React frontend
-* [x] Develop the FastAPI backend
-* [x] Support SQLite and PostgreSQL databases
+* [X] Build the React frontend
+* [X] Develop the FastAPI backend
+* [X] Support SQLite and PostgreSQL databases
 * [ ] Add pgvector semantic search
-* [x] Implement incident submission and local database storage
-* [ ] Add semantic search for resolved bugs
-* [ ] Integrate the Qwen model for AI-assisted troubleshooting
-* [x] Add Team Lead review and incident verification
-* [x] Add workspace and project organization
-* [x] Add team accounts, multiple Team Leads, and member management
-* [x] Add incident priorities and library filters
+* [X] Implement incident submission and local database storage
+* [X] Add semantic search for resolved bugs (Ollama embeddings)
+* [X] Add AI-assisted troubleshooting with a local Ollama model (RAG over verified incidents)
+* [X] Add Team Lead review and incident verification
+* [X] Add workspace and project organization
+* [X] Add team accounts, multiple Team Leads, and member management
+* [X] Add incident priorities and library filters
 * [ ] Test with real-world debugging scenarios
 * [ ] Deploy a working demo
 

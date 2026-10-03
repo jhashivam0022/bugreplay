@@ -23,7 +23,16 @@ class Incident(Base):
     author: Mapped[str] = mapped_column(String(100), nullable=False, default="Team member")
     verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     priority: Mapped[str] = mapped_column(String(8), nullable=False, default="medium")
+    environment: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    steps: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    prevention: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    reference_url: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    resolution_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    author_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    embedding: Mapped[str | None] = mapped_column(Text, nullable=True, deferred=True)
+    embedding_model: Mapped[str | None] = mapped_column(String(80), nullable=True)
 
     project: Mapped[Project | None] = relationship(back_populates="incidents")
 
