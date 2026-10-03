@@ -79,18 +79,14 @@ The goal is not to replace developers or mentors, but to help teams debug smarte
 
 ## 🚀 Getting Started
 
-BugReplay is currently in its initial development stage. Setup instructions will be updated as the application and its configuration become available.
+BugReplay runs locally with a React/Vite frontend and a FastAPI backend. The backend creates a SQLite database at `backend/bugreplay.db` on first run and adds starter incidents and projects.
 
 ### Prerequisites
 
-The planned development environment includes:
+* Python 3.10 or newer
+* Node.js 20 or newer and npm
 
-* Node.js and npm
-* Python 3.10+
-* PostgreSQL with pgvector
-* An environment capable of running the selected Qwen model, locally or through a compatible inference service
-
-### Installation
+### Install and run the backend
 
 Clone the repository:
 
@@ -99,7 +95,41 @@ git clone https://github.com/jhashivam0022/bugreplay.git
 cd bugreplay
 ```
 
-Setup and run instructions for the frontend and backend will be added as the project implementation progresses.
+Create a virtual environment in `backend`, install dependencies, and start the API.
+
+**Windows PowerShell**
+
+```powershell
+cd backend
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m uvicorn app.main:app --reload
+```
+
+**macOS or Linux**
+
+```bash
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m uvicorn app.main:app --reload
+```
+
+### Install and run the frontend
+
+Open a second terminal from the repository root:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open [http://localhost:5173](http://localhost:5173). The API runs at [http://localhost:8000](http://localhost:8000), and its interactive documentation is at [http://localhost:8000/docs](http://localhost:8000/docs). Keep both servers running while using the app.
+
+On first run, create the Team Lead account from the setup screen. The first account becomes Team Lead for the default workspace; there is no default password. Team Leads can add employees or other Team Leads from the **Team members** sidebar tab.
 
 ## 🔐 Privacy and Security
 
@@ -112,14 +142,17 @@ BugReplay is intended to work with approved, non-sensitive debugging incidents.
 
 ## 🗺️ Roadmap
 
-* [ ] Build the React frontend
-* [ ] Develop the FastAPI backend
-* [ ] Integrate PostgreSQL and pgvector
-* [ ] Implement incident submission and storage
+* [x] Build the React frontend
+* [x] Develop the FastAPI backend
+* [x] Support SQLite and PostgreSQL databases
+* [ ] Add pgvector semantic search
+* [x] Implement incident submission and local database storage
 * [ ] Add semantic search for resolved bugs
 * [ ] Integrate the Qwen model for AI-assisted troubleshooting
-* [ ] Add mentor review and solution verification
-* [ ] Build incident history and knowledge management
+* [x] Add Team Lead review and incident verification
+* [x] Add workspace and project organization
+* [x] Add team accounts, multiple Team Leads, and member management
+* [x] Add incident priorities and library filters
 * [ ] Test with real-world debugging scenarios
 * [ ] Deploy a working demo
 
